@@ -223,6 +223,8 @@ def dataset_states_to_obs(args):
 
     # create environment to use for data processing
     env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path=args.dataset)
+    if args.env_name_override is not None:
+        env_meta["env_name"] = args.env_name_override
     env = EnvUtils.create_env_for_data_processing(
         env_meta=env_meta,
         camera_names=args.camera_names, 
@@ -270,7 +272,7 @@ def dataset_states_to_obs(args):
         # prepare initial state to reload from
         states = f["data/{}/states".format(ep)][()]
         initial_state = dict(states=states[0])
-        if is_robosuite_env:
+        if is_robosuite_env and (not args.ignore_stored_model):
             initial_state["model"] = f["data/{}".format(ep)].attrs["model_file"]
             initial_state["ep_meta"] = f["data/{}".format(ep)].attrs.get("ep_meta", None)
 
@@ -327,7 +329,7 @@ def dataset_states_to_obs(args):
                 ep_data_grp.create_dataset("action_dict/{}".format(k), data=np.array(action_dict[k][()]))
 
         # episode metadata
-        if is_robosuite_env:
+        if is_robosuite_env and ("model" in traj["initial_state_dict"]):
             ep_data_grp.attrs["model_file"] = traj["initial_state_dict"]["model"] # model xml for this episode
         if "ep_meta" in f["data/{}".format(ep)].attrs:
             ep_data_grp.attrs["ep_meta"] = f["data/{}".format(ep)].attrs["ep_meta"]
@@ -452,6 +454,19 @@ if __name__ == "__main__":
         "--compress", 
         action='store_true',
         help="(optional) compress observations with gzip option in hdf5",
+    )
+
+    parser.add_argument(
+        "--env_name_override",
+        type=str,
+        default=None,
+        help="(optional) override the environment name stored in dataset metadata when rendering observations",
+    )
+
+    parser.add_argument(
+        "--ignore_stored_model",
+        action='store_true',
+        help="(optional) ignore per-episode stored MuJoCo XML so rendering uses the currently selected environment class",
     )
 
     args = parser.parse_args()
