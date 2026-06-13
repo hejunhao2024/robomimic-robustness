@@ -75,6 +75,22 @@ python dataset_states_to_obs.py --done_mode 2 \
 python dataset_states_to_obs.py --done_mode 2 \
 --dataset $BASE_DATASET_DIR/square/ph/demo_v15.hdf5 \
 --output_name image_v15.hdf5 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84
+python dataset_states_to_obs.py --done_mode 2 \
+--dataset $BASE_DATASET_DIR/square/ph/demo_v15.hdf5 \
+--output_name image_v15_train_visualdr.hdf5 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84 \
+--env_name_override NutAssemblySquareTrainVisualDR --ignore_stored_model --reset_env_each_demo
+python dataset_states_to_obs.py --done_mode 2 \
+--dataset $BASE_DATASET_DIR/square/ph/demo_v15.hdf5 \
+--output_name image_v15_colorood.hdf5 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84 \
+--env_name_override NutAssemblySquareColorPerturb --ignore_stored_model
+python dataset_states_to_obs.py --done_mode 2 \
+--dataset $BASE_DATASET_DIR/square/ph/demo_v15.hdf5 \
+--output_name image_v15_cameraood.hdf5 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84 \
+--env_name_override NutAssemblySquareCameraPerturb --ignore_stored_model
+python dataset_states_to_obs.py --done_mode 2 \
+--dataset $BASE_DATASET_DIR/square/ph/demo_v15.hdf5 \
+--output_name image_v15_visualood.hdf5 --camera_names agentview robot0_eye_in_hand --camera_height 84 --camera_width 84 \
+--env_name_override NutAssemblySquareVisualOOD --ignore_stored_model
 
 # transport - ph
 python dataset_states_to_obs.py --done_mode 2 \

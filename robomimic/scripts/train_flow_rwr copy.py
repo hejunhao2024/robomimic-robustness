@@ -11,7 +11,7 @@ import shutil
 import sys
 import traceback
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from copy import deepcopy
 
 import numpy as np
@@ -397,449 +397,6 @@ def compute_stage_curriculum(config, iter_idx, num_iters):
         for stage_id in range(1, 5)
     }
     return priorities, float(progress)
-
-
-
-def _episode_stage_counts(episodes):
-    episodes = list(episodes)
-    total = len(episodes)
-    reached = {
-        stage_id: sum(
-            int(ep.get("highest_stage_id", 0)) >= stage_id
-            for ep in episodes
-        )
-        for stage_id in range(1, 5)
-    }
-    return total, reached
-
-
-def summarize_episodes_by_environment(episodes):
-    grouped = defaultdict(list)
-    for episode in episodes:
-        grouped[str(episode.get("env_name", "unknown"))].append(episode)
-
-    report = {}
-    flat_stats = {}
-    for env_name, env_episodes in sorted(grouped.items()):
-        total, reached = _episode_stage_counts(env_episodes)
-        rates = {
-            stage_id: (
-                float(reached[stage_id] / total)
-                if total > 0
-                else 0.0
-            )
-            for stage_id in range(1, 5)
-        }
-        conditional = {
-            "lift_given_grasp": (
-                float(reached[2] / reached[1])
-                if reached[1] > 0
-                else 0.0
-            ),
-            "peg_align_given_lift": (
-                float(reached[3] / reached[2])
-                if reached[2] > 0
-                else 0.0
-            ),
-            "success_given_peg_align": (
-                float(reached[4] / reached[3])
-                if reached[3] > 0
-                else 0.0
-            ),
-        }
-        report[env_name] = {
-            "episodes": int(total),
-            "stable_grasp": {
-                "reached": int(reached[1]),
-                "rate": rates[1],
-            },
-            "lift": {
-                "reached": int(reached[2]),
-                "rate": rates[2],
-            },
-            "peg_align": {
-                "reached": int(reached[3]),
-                "rate": rates[3],
-            },
-            "success": {
-                "reached": int(reached[4]),
-                "rate": rates[4],
-            },
-            "conditional_conversion": conditional,
-        }
-
-        safe_name = (
-            env_name.replace("/", "_")
-            .replace(" ", "_")
-            .replace(":", "_")
-        )
-        flat_stats[f"env_{safe_name}_episodes"] = int(total)
-        for stage_id, stage_name in (
-            (1, "stable_grasp"),
-            (2, "lift"),
-            (3, "hover"),
-            (4, "success"),
-        ):
-            flat_stats[
-                f"env_{safe_name}_rate_reaching_{stage_name}"
-            ] = rates[stage_id]
-            flat_stats[
-                f"env_{safe_name}_num_reaching_{stage_name}"
-            ] = int(reached[stage_id])
-        for key, value in conditional.items():
-            flat_stats[f"env_{safe_name}_{key}"] = float(value)
-
-    print("\n[EnvironmentStageCompletion]")
-    print(json.dumps(report, sort_keys=True, indent=4))
-    return report, flat_stats
-
-
-def compute_environment_curriculum(
-    config,
-    iter_idx,
-    num_workers,
-    num_episodes,
-):
-    section = _config_get(
-        config.train.online,
-        "environment_curriculum",
-        None,
-    )
-    default_env = (
-        config.train.online.env_name
-        if config.train.online.env_name is not None
-        else "NutAssemblySquare"
-    )
-
-    if section is None or not bool(
-        _config_get(section, "enabled", True)
-    ):
-        worker_env_names = [str(default_env)] * int(num_workers)
-        return {
-            "phase_name": "single_env",
-            "easy_env": str(default_env),
-            "hard_env": str(default_env),
-            "worker_env_names": worker_env_names,
-            "episode_quotas": {
-                str(default_env): int(num_episodes),
-            },
-            "worker_counts": {
-                str(default_env): int(num_workers),
-            },
-        }
-
-    easy_env = str(
-        _config_get(section, "easy_env", "NutAssemblySquare")
-    )
-    hard_env = str(
-        _config_get(
-            section,
-            "hard_env",
-            "NutAssemblySquareTrainVisualDR",
-        )
-    )
-    phases = list(_config_get(section, "phases", []))
-    if len(phases) == 0:
-        raise ValueError(
-            "environment_curriculum.phases must not be empty"
-        )
-
-    selected = None
-    for phase in phases:
-        start_epoch = int(_config_get(phase, "start_epoch", 1))
-        end_epoch = int(
-            _config_get(phase, "end_epoch", 10 ** 9)
-        )
-        if start_epoch <= int(iter_idx) <= end_epoch:
-            selected = phase
-            break
-    if selected is None:
-        selected = phases[-1]
-
-    easy_workers = int(
-        _config_get(selected, "easy_workers", 0)
-    )
-    hard_workers = int(
-        _config_get(
-            selected,
-            "hard_workers",
-            int(num_workers) - easy_workers,
-        )
-    )
-    if easy_workers < 0 or hard_workers < 0:
-        raise ValueError("environment worker counts must be non-negative")
-    if easy_workers + hard_workers != int(num_workers):
-        raise ValueError(
-            "easy_workers + hard_workers must equal num_rollout_workers: "
-            f"{easy_workers} + {hard_workers} != {num_workers}"
-        )
-
-    worker_env_names = (
-        [easy_env] * easy_workers
-        + [hard_env] * hard_workers
-    )
-    base_per_worker = int(num_episodes) // int(num_workers)
-    remainder = int(num_episodes) % int(num_workers)
-
-    episode_quotas = defaultdict(int)
-    for worker_id, env_name in enumerate(worker_env_names):
-        episode_quotas[env_name] += base_per_worker
-        if worker_id < remainder:
-            episode_quotas[env_name] += 1
-
-    phase_name = str(
-        _config_get(
-            selected,
-            "name",
-            f"easy{easy_workers}_hard{hard_workers}",
-        )
-    )
-    result = {
-        "phase_name": phase_name,
-        "easy_env": easy_env,
-        "hard_env": hard_env,
-        "worker_env_names": worker_env_names,
-        "episode_quotas": dict(episode_quotas),
-        "worker_counts": {
-            easy_env: int(easy_workers),
-            hard_env: int(hard_workers),
-        },
-    }
-    print("\n[EnvironmentCurriculum]")
-    print(json.dumps({
-        "epoch": int(iter_idx),
-        "phase_name": phase_name,
-        "worker_counts": result["worker_counts"],
-        "episode_quotas": result["episode_quotas"],
-    }, sort_keys=True, indent=4))
-    return result
-
-
-class AdaptiveStageController:
-    """
-    EMA bottleneck controller for stage priorities.
-
-    The fixed time curriculum supplies the broad front-to-back progression.
-    This controller only applies a bounded correction according to conditional
-    success rates, preferably measured on the hard environment.
-    """
-
-    def __init__(self, config):
-        section = _config_get(
-            config.algo.rwr,
-            "adaptive_stage_curriculum",
-            None,
-        )
-        self.enabled = bool(
-            _config_get(section, "enabled", True)
-        )
-        self.ema_beta = float(
-            _config_get(section, "ema_beta", 0.90)
-        )
-        self.prior_success = float(
-            _config_get(section, "prior_success", 2.0)
-        )
-        self.prior_failure = float(
-            _config_get(section, "prior_failure", 2.0)
-        )
-        self.deficit_gamma = float(
-            _config_get(section, "deficit_gamma", 1.5)
-        )
-        self.strength = float(
-            _config_get(section, "strength", 1.25)
-        )
-        self.min_multiplier = float(
-            _config_get(section, "min_multiplier", 0.70)
-        )
-        self.max_multiplier = float(
-            _config_get(section, "max_multiplier", 1.80)
-        )
-        self.min_focus_episodes = int(
-            _config_get(section, "min_focus_episodes", 4)
-        )
-
-        default_min = {
-            1: 0.15,
-            2: 0.30,
-            3: 0.50,
-            4: 1.00,
-        }
-        default_max = {
-            1: 2.00,
-            2: 4.50,
-            3: 5.00,
-            4: 6.00,
-        }
-        self.min_priorities = _read_stage_weight_map(
-            section,
-            "min_priorities",
-            default_min,
-        )
-        self.max_priorities = _read_stage_weight_map(
-            section,
-            "max_priorities",
-            default_max,
-        )
-        self.ema_rates = {
-            stage_id: None
-            for stage_id in range(1, 5)
-        }
-        self.last_update = {}
-
-    def update(self, episodes, focus_env_name=None):
-        episodes = list(episodes)
-        focus_episodes = [
-            ep for ep in episodes
-            if str(ep.get("env_name", "unknown"))
-            == str(focus_env_name)
-        ]
-        if len(focus_episodes) >= self.min_focus_episodes:
-            selected = focus_episodes
-            source = str(focus_env_name)
-        else:
-            selected = episodes
-            source = "all_environments"
-
-        total, reached = _episode_stage_counts(selected)
-        numerators = {
-            1: reached[1],
-            2: reached[2],
-            3: reached[3],
-            4: reached[4],
-        }
-        denominators = {
-            1: total,
-            2: reached[1],
-            3: reached[2],
-            4: reached[3],
-        }
-
-        posterior_rates = {}
-        for stage_id in range(1, 5):
-            numerator = float(numerators[stage_id])
-            denominator = float(denominators[stage_id])
-            posterior = (
-                numerator + self.prior_success
-            ) / (
-                denominator
-                + self.prior_success
-                + self.prior_failure
-            )
-            posterior_rates[stage_id] = float(posterior)
-
-            previous = self.ema_rates[stage_id]
-            if previous is None:
-                self.ema_rates[stage_id] = float(posterior)
-            else:
-                self.ema_rates[stage_id] = float(
-                    self.ema_beta * previous
-                    + (1.0 - self.ema_beta) * posterior
-                )
-
-        self.last_update = {
-            "source": source,
-            "episodes": int(total),
-            "posterior_rates": posterior_rates,
-            "ema_rates": dict(self.ema_rates),
-            "numerators": numerators,
-            "denominators": denominators,
-        }
-        return self.last_update
-
-    def adjust(self, base_priorities):
-        if not self.enabled:
-            return dict(base_priorities), {
-                "multipliers": {
-                    stage_id: 1.0 for stage_id in range(1, 5)
-                },
-                "ema_rates": dict(self.ema_rates),
-            }
-
-        rates = {
-            stage_id: (
-                0.5
-                if self.ema_rates[stage_id] is None
-                else float(self.ema_rates[stage_id])
-            )
-            for stage_id in range(1, 5)
-        }
-        deficits = {
-            stage_id: float(
-                max(0.0, 1.0 - rates[stage_id])
-                ** self.deficit_gamma
-            )
-            for stage_id in range(1, 5)
-        }
-        mean_deficit = float(np.mean(list(deficits.values())))
-
-        multipliers = {}
-        raw = {}
-        for stage_id in range(1, 5):
-            multiplier = 1.0 + self.strength * (
-                deficits[stage_id] - mean_deficit
-            )
-            multiplier = float(np.clip(
-                multiplier,
-                self.min_multiplier,
-                self.max_multiplier,
-            ))
-            multipliers[stage_id] = multiplier
-            raw[stage_id] = (
-                float(base_priorities[stage_id]) * multiplier
-            )
-
-        base_sum = float(sum(base_priorities.values()))
-        raw_sum = float(sum(raw.values()))
-        scale = base_sum / max(raw_sum, 1e-8)
-
-        adjusted = {
-            stage_id: float(np.clip(
-                raw[stage_id] * scale,
-                self.min_priorities[stage_id],
-                self.max_priorities[stage_id],
-            ))
-            for stage_id in range(1, 5)
-        }
-        metadata = {
-            "ema_rates": rates,
-            "deficits": deficits,
-            "multipliers": multipliers,
-            "base_priorities": dict(base_priorities),
-            "adjusted_priorities": dict(adjusted),
-            "last_update": dict(self.last_update),
-        }
-
-        printable = {
-            "ema_condition_rates": {
-                STAGE_NAMES[stage_id]: rates[stage_id]
-                for stage_id in range(1, 5)
-            },
-            "base_priorities": {
-                STAGE_NAMES[stage_id]: base_priorities[stage_id]
-                for stage_id in range(1, 5)
-            },
-            "adaptive_multipliers": {
-                STAGE_NAMES[stage_id]: multipliers[stage_id]
-                for stage_id in range(1, 5)
-            },
-            "final_priorities": {
-                STAGE_NAMES[stage_id]: adjusted[stage_id]
-                for stage_id in range(1, 5)
-            },
-            "statistics_source": self.last_update.get(
-                "source", "uninitialized"
-            ),
-        }
-        print("\n[AdaptiveStageCurriculum]")
-        print(json.dumps(printable, sort_keys=True, indent=4))
-        return adjusted, metadata
-
-    def state_dict(self):
-        return {
-            "ema_rates": dict(self.ema_rates),
-            "last_update": dict(self.last_update),
-        }
-
 
 
 def _extract_new_stage_ids(info, previous_max_stage_id):
@@ -1334,16 +891,18 @@ def _subprocess_env_worker(
     config_dict,
     env_meta,
     shape_meta,
-    initial_env_name,
 ):
-    """Own one switchable robosuite environment in a spawned process."""
+    """Own one robosuite environment inside an isolated spawned process."""
     env = None
-    current_env_name = None
     current_obs = None
-
     try:
         torch.set_num_threads(1)
         config = _rebuild_worker_config(config_dict)
+
+        # ``spawn`` starts a fresh Python interpreter. Robomimic observation
+        # modality mappings are process-local globals, so the initialization
+        # performed in the parent process is not inherited by this worker.
+        # This must happen before creating / resetting the environment.
         ObsUtils.initialize_obs_utils_with_config(config)
 
         worker_seed = int(config.train.seed) + 100003 * int(worker_id)
@@ -1351,42 +910,28 @@ def _subprocess_env_worker(
         np.random.seed(worker_seed)
         torch.manual_seed(worker_seed)
 
-        def close_current_env():
-            nonlocal env
-            if env is not None and hasattr(env, "close"):
-                try:
-                    env.close()
-                except Exception:
-                    pass
-            env = None
-
-        def ensure_env(env_name):
-            nonlocal env, current_env_name
-            env_name = str(env_name)
-            if env is not None and current_env_name == env_name:
-                return
-            close_current_env()
-            env = create_one_env(
-                config=config,
-                env_meta=env_meta,
-                shape_meta=shape_meta,
-                env_name=env_name,
-            )
-            try:
-                if hasattr(env, "seed"):
-                    env.seed(worker_seed)
-            except Exception:
-                pass
-            current_env_name = env_name
-
-        ensure_env(initial_env_name)
+        env_name = (
+            config.train.online.env_name
+            if config.train.online.env_name is not None
+            else env_meta["env_name"]
+        )
+        env = create_one_env(
+            config=config,
+            env_meta=env_meta,
+            shape_meta=shape_meta,
+            env_name=env_name,
+        )
+        try:
+            if hasattr(env, "seed"):
+                env.seed(worker_seed)
+        except Exception:
+            pass
 
         connection.send((
             "ready",
             {
                 "worker_id": int(worker_id),
                 "seed": int(worker_seed),
-                "env_name": str(current_env_name),
             },
         ))
 
@@ -1394,19 +939,8 @@ def _subprocess_env_worker(
             command, payload = connection.recv()
 
             if command == "reset":
-                payload = payload or {}
-                requested_env_name = str(
-                    payload.get("env_name", current_env_name)
-                )
-                ensure_env(requested_env_name)
                 current_obs = env.reset()
-                connection.send((
-                    "ok",
-                    {
-                        "obs": current_obs,
-                        "env_name": str(current_env_name),
-                    },
-                ))
+                connection.send(("ok", current_obs))
                 continue
 
             if command == "step_chunk":
@@ -1452,15 +986,17 @@ def _subprocess_env_worker(
                         "obs": current_obs,
                         "transitions": transitions,
                         "done": bool(done),
-                        "env_name": str(current_env_name),
                     },
                 ))
                 continue
 
             if command == "close":
-                close_current_env()
-                connection.send(("closed", None))
-                break
+                try:
+                    if env is not None and hasattr(env, "close"):
+                        env.close()
+                finally:
+                    connection.send(("closed", None))
+                    break
 
             raise ValueError(f"unknown worker command: {command}")
 
@@ -1471,11 +1007,6 @@ def _subprocess_env_worker(
             pass
     finally:
         try:
-            if env is not None and hasattr(env, "close"):
-                env.close()
-        except Exception:
-            pass
-        try:
             connection.close()
         except Exception:
             pass
@@ -1485,21 +1016,14 @@ class SubprocessEnvPool:
     """
     Spawned robosuite workers with central batched GPU policy inference.
 
-    Workers can switch environment type at curriculum phase boundaries. Within
-    an epoch, each worker repeatedly collects episodes from its assigned
-    environment, enabling dynamic refill and preventing long-tail batch collapse.
+    All commands are sent before any result is received, so the environments
+    execute their action chunks concurrently.
     """
 
-    def __init__(
-        self,
-        config,
-        env_meta,
-        shape_meta,
-        initial_env_names,
-    ):
-        self.num_workers = int(len(initial_env_names))
+    def __init__(self, config, env_meta, shape_meta, num_workers):
+        self.num_workers = int(num_workers)
         if self.num_workers <= 0:
-            raise ValueError("at least one rollout worker is required")
+            raise ValueError("num_workers must be positive")
 
         self._closed = False
         self._ctx = mp.get_context("spawn")
@@ -1507,7 +1031,8 @@ class SubprocessEnvPool:
         self._processes = []
 
         config_dict = json.loads(json.dumps(config))
-        for worker_id, initial_env_name in enumerate(initial_env_names):
+
+        for worker_id in range(self.num_workers):
             parent_connection, child_connection = self._ctx.Pipe()
             process = self._ctx.Process(
                 target=_subprocess_env_worker,
@@ -1517,7 +1042,6 @@ class SubprocessEnvPool:
                     config_dict,
                     env_meta,
                     shape_meta,
-                    str(initial_env_name),
                 ),
                 daemon=True,
             )
@@ -1546,19 +1070,13 @@ class SubprocessEnvPool:
             )
         return payload
 
-    def reset(self, worker_env_assignments):
-        assignments = {
-            int(worker_id): str(env_name)
-            for worker_id, env_name in worker_env_assignments.items()
-        }
-        for worker_id, env_name in assignments.items():
-            self._connections[worker_id].send((
-                "reset",
-                {"env_name": env_name},
-            ))
+    def reset(self, worker_ids):
+        worker_ids = [int(worker_id) for worker_id in worker_ids]
+        for worker_id in worker_ids:
+            self._connections[worker_id].send(("reset", None))
         return {
             worker_id: self._receive(worker_id)
-            for worker_id in assignments
+            for worker_id in worker_ids
         }
 
     def step_chunks(
@@ -1627,17 +1145,10 @@ class SubprocessEnvPool:
                 pass
 
 
-
-def _new_parallel_rollout_state(
-    worker_id,
-    episode_id,
-    obs,
-    env_name,
-):
+def _new_parallel_rollout_state(worker_id, episode_id, obs):
     return {
         "worker_id": int(worker_id),
         "episode_id": int(episode_id),
-        "env_name": str(env_name),
         "obs": obs,
         "steps": [],
         "chunk_records": [],
@@ -1837,19 +1348,18 @@ def collect_rollout_episodes_parallel(
     num_episodes,
     horizon,
     terminate_on_success,
-    worker_env_names,
-    episode_quotas,
     progress_desc="Rollout",
 ):
     """
-    Dynamic-refill parallel rollout.
-
-    A completed worker immediately starts another episode from the same assigned
-    environment while quota remains. With 16 workers and 32 episodes, this keeps
-    the Flow inference batch near 16 for much longer than a single fixed wave.
+    Collect rollout waves using:
+      1. one spawned robosuite process per environment;
+      2. one central batched Flow inference call for all active workers.
     """
     observation_horizon = int(
         model.algo_config.horizon.observation_horizon
+    )
+    action_horizon = int(
+        model.algo_config.horizon.action_horizon
     )
     prediction_horizon = int(
         model.algo_config.horizon.prediction_horizon
@@ -1858,51 +1368,13 @@ def collect_rollout_episodes_parallel(
     num_episodes = int(num_episodes)
     if num_episodes <= 0:
         return []
-    if len(worker_env_names) != env_pool.num_workers:
-        raise ValueError(
-            "worker_env_names length must equal env_pool.num_workers"
-        )
-
-    remaining = {
-        str(env_name): int(count)
-        for env_name, count in episode_quotas.items()
-    }
-    if sum(remaining.values()) != num_episodes:
-        raise ValueError(
-            "episode quotas must sum to num_episodes: "
-            f"{sum(remaining.values())} != {num_episodes}"
-        )
 
     episodes = []
-    active_states = {}
     next_episode_id = 0
-    inference_rounds = 0
-    policy_batch_sizes = []
     model.reset()
 
-    def refill(worker_ids):
-        nonlocal next_episode_id
-        assignments = {}
-        for worker_id in sorted(worker_ids):
-            env_name = str(worker_env_names[int(worker_id)])
-            if remaining.get(env_name, 0) <= 0:
-                continue
-            remaining[env_name] -= 1
-            assignments[int(worker_id)] = env_name
-
-        if len(assignments) == 0:
-            return
-
-        reset_results = env_pool.reset(assignments)
-        for worker_id, env_name in assignments.items():
-            payload = reset_results[worker_id]
-            active_states[worker_id] = _new_parallel_rollout_state(
-                worker_id=worker_id,
-                episode_id=next_episode_id,
-                obs=payload["obs"],
-                env_name=payload.get("env_name", env_name),
-            )
-            next_episode_id += 1
+    inference_rounds = 0
+    policy_batch_sizes = []
 
     with tqdm(
         total=num_episodes,
@@ -1911,117 +1383,123 @@ def collect_rollout_episodes_parallel(
         leave=True,
         unit="episode",
     ) as rollout_progress:
-        refill(range(env_pool.num_workers))
+        while next_episode_id < num_episodes:
+            wave_size = min(
+                env_pool.num_workers,
+                num_episodes - next_episode_id,
+            )
+            worker_ids = list(range(wave_size))
+            initial_obs = env_pool.reset(worker_ids)
 
-        while len(active_states) > 0:
-            active_worker_ids = sorted(active_states.keys())
             states = [
-                active_states[worker_id]
-                for worker_id in active_worker_ids
-            ]
-
-            active_batch_size = len(states)
-            policy_batch_sizes.append(active_batch_size)
-            inference_rounds += 1
-
-            observations = [state["obs"] for state in states]
-            policy_chunks, env_chunks = sample_action_chunks_batched(
-                rollout_policy=rollout_policy,
-                model=model,
-                observations=observations,
-            )
-
-            max_steps = [
-                int(horizon) - int(state["timestep"])
-                for state in states
-            ]
-            results = env_pool.step_chunks(
-                worker_ids=active_worker_ids,
-                env_action_chunks=env_chunks,
-                max_steps=max_steps,
-                terminate_on_success=terminate_on_success,
-            )
-
-            completed_workers = []
-            for state, policy_chunk, env_chunk in zip(
-                states,
-                policy_chunks,
-                env_chunks,
-            ):
-                worker_id = int(state["worker_id"])
-                _consume_parallel_chunk(
-                    state=state,
-                    policy_action_chunk=policy_chunk,
-                    env_action_chunk=env_chunk,
-                    result=results[worker_id],
+                _new_parallel_rollout_state(
+                    worker_id=worker_id,
+                    episode_id=next_episode_id + local_index,
+                    obs=initial_obs[worker_id],
                 )
-                if state["done"]:
-                    episodes.append(
-                        _finalize_rollout_state(
-                            state=state,
-                            observation_horizon=observation_horizon,
-                            prediction_horizon=prediction_horizon,
-                        )
+                for local_index, worker_id in enumerate(worker_ids)
+            ]
+            next_episode_id += wave_size
+
+            while any(not state["done"] for state in states):
+                active_states = [
+                    state for state in states
+                    if not state["done"]
+                ]
+                active_batch_size = len(active_states)
+                policy_batch_sizes.append(active_batch_size)
+                inference_rounds += 1
+
+                observations = [
+                    state["obs"] for state in active_states
+                ]
+
+                policy_chunks, env_chunks = sample_action_chunks_batched(
+                    rollout_policy=rollout_policy,
+                    model=model,
+                    observations=observations,
+                )
+
+                active_worker_ids = [
+                    state["worker_id"] for state in active_states
+                ]
+                max_steps = [
+                    int(horizon) - int(state["timestep"])
+                    for state in active_states
+                ]
+
+                results = env_pool.step_chunks(
+                    worker_ids=active_worker_ids,
+                    env_action_chunks=env_chunks,
+                    max_steps=max_steps,
+                    terminate_on_success=terminate_on_success,
+                )
+
+                newly_completed = 0
+                for state, policy_chunk, env_chunk in zip(
+                    active_states,
+                    policy_chunks,
+                    env_chunks,
+                ):
+                    was_done = bool(state["done"])
+                    _consume_parallel_chunk(
+                        state=state,
+                        policy_action_chunk=policy_chunk,
+                        env_action_chunk=env_chunk,
+                        result=results[state["worker_id"]],
                     )
-                    del active_states[worker_id]
-                    completed_workers.append(worker_id)
-                    rollout_progress.update(1)
+                    if (not was_done) and bool(state["done"]):
+                        newly_completed += 1
 
-            # Immediately refill completed slots from the same environment.
-            refill(completed_workers)
+                if newly_completed > 0:
+                    rollout_progress.update(newly_completed)
 
-            mean_batch = float(np.mean(policy_batch_sizes))
-            rollout_progress.set_postfix(
-                active_batch=active_batch_size,
-                mean_batch=f"{mean_batch:.2f}",
-                infer_rounds=inference_rounds,
-                refresh=False,
-            )
+                mean_batch = float(np.mean(policy_batch_sizes))
+                rollout_progress.set_postfix(
+                    active_batch=active_batch_size,
+                    mean_batch=f"{mean_batch:.2f}",
+                    infer_rounds=inference_rounds,
+                    refresh=False,
+                )
 
-    if len(episodes) != num_episodes:
-        raise RuntimeError(
-            f"collected {len(episodes)} episodes, expected {num_episodes}"
-        )
-    if any(value != 0 for value in remaining.values()):
-        raise RuntimeError(
-            f"unconsumed environment episode quotas: {remaining}"
-        )
+            episodes.extend([
+                _finalize_rollout_state(
+                    state=state,
+                    observation_horizon=observation_horizon,
+                    prediction_horizon=prediction_horizon,
+                )
+                for state in states
+            ])
 
     episodes.sort(key=lambda episode: episode["episode_id"])
-    env_episode_counts = defaultdict(int)
-    for episode in episodes:
-        env_episode_counts[str(episode["env_name"])] += 1
 
-    parallel_stats = {
-        "workers": int(env_pool.num_workers),
-        "episodes": int(num_episodes),
-        "inference_rounds": int(inference_rounds),
-        "max_policy_batch": (
-            int(max(policy_batch_sizes))
-            if policy_batch_sizes else 0
-        ),
-        "min_policy_batch": (
-            int(min(policy_batch_sizes))
-            if policy_batch_sizes else 0
-        ),
-        "mean_policy_batch": (
-            float(np.mean(policy_batch_sizes))
-            if policy_batch_sizes else 0.0
-        ),
-        "batch_utilization": (
-            float(
+    if policy_batch_sizes:
+        parallel_stats = {
+            "workers": int(env_pool.num_workers),
+            "episodes": int(num_episodes),
+            "inference_rounds": int(inference_rounds),
+            "max_policy_batch": int(max(policy_batch_sizes)),
+            "min_policy_batch": int(min(policy_batch_sizes)),
+            "mean_policy_batch": float(np.mean(policy_batch_sizes)),
+            "batch_utilization": float(
                 np.mean(policy_batch_sizes)
                 / max(float(env_pool.num_workers), 1.0)
-            )
-            if policy_batch_sizes else 0.0
-        ),
-        "episodes_by_environment": dict(env_episode_counts),
-        "dynamic_refill": True,
-    }
+            ),
+        }
+    else:
+        parallel_stats = {
+            "workers": int(env_pool.num_workers),
+            "episodes": int(num_episodes),
+            "inference_rounds": 0,
+            "max_policy_batch": 0,
+            "min_policy_batch": 0,
+            "mean_policy_batch": 0.0,
+            "batch_utilization": 0.0,
+        }
+
     print("\n[ParallelRollout]")
     print(json.dumps(parallel_stats, sort_keys=True, indent=4))
     return episodes
-
 
 
 
@@ -2475,12 +1953,8 @@ def _finalize_rollout_state(
         stage_achievement_steps=state["stage_achievement_steps"],
         highest_stage_id=highest_stage_id,
     )
-    for segment in segments:
-        segment["env_name"] = str(state.get("env_name", "unknown"))
-
     return {
         "episode_id": int(state["episode_id"]),
-        "env_name": str(state.get("env_name", "unknown")),
         "steps": state["steps"],
         "segments": segments,
         "success": bool(state["success"]),
@@ -2672,6 +2146,11 @@ def train(config, device):
     demo_loader = make_demo_loader(trainset, demo_batch_size, config.train.num_data_workers) if demo_batch_size > 0 else None
     demo_iter = iter(demo_loader) if demo_loader is not None else None
 
+    train_env_name = (
+        config.train.online.env_name
+        if config.train.online.env_name is not None
+        else env_meta["env_name"]
+    )
     num_rollout_workers = int(
         _config_get(
             config.train.online,
@@ -2679,37 +2158,23 @@ def train(config, device):
             _config_get(
                 config.train.online,
                 "num_rollout_envs",
-                16,
+                8,
             ),
         )
-    )
-    num_rollout_episodes = int(
-        config.train.online.num_rollout_episodes_per_iter
-    )
-    initial_environment_phase = compute_environment_curriculum(
-        config=config,
-        iter_idx=1,
-        num_workers=num_rollout_workers,
-        num_episodes=num_rollout_episodes,
     )
     parallel_env_pool = SubprocessEnvPool(
         config=config,
         env_meta=env_meta,
         shape_meta=shape_meta,
-        initial_env_names=initial_environment_phase[
-            "worker_env_names"
-        ],
+        num_workers=num_rollout_workers,
     )
     atexit.register(parallel_env_pool.close)
 
-    adaptive_stage_controller = AdaptiveStageController(config)
     rollout_envs = OrderedDict()
     print(
         "[rollout pool]",
         "num_workers=", parallel_env_pool.num_workers,
-        "episodes_per_epoch=", num_rollout_episodes,
-        "mode=dynamic_refill_subprocess_envs"
-        "+central_batched_flow_inference",
+        "mode=subprocess_envs+central_batched_flow_inference",
     )
 
     data_logger = DataLogger(
@@ -2745,18 +2210,12 @@ def train(config, device):
         collection_start = time.perf_counter()
 
         model.set_eval()
-        base_stage_priorities, curriculum_progress = (
+        stage_priorities, curriculum_progress = (
             compute_stage_curriculum(
                 config=config,
                 iter_idx=iter_idx,
                 num_iters=num_iters,
             )
-        )
-        environment_phase = compute_environment_curriculum(
-            config=config,
-            iter_idx=iter_idx,
-            num_workers=num_rollout_workers,
-            num_episodes=num_rollout_episodes,
         )
 
         buffer = FlowRolloutBuffer(
@@ -2774,32 +2233,15 @@ def train(config, device):
             env_pool=parallel_env_pool,
             rollout_policy=rollout_policy,
             model=model,
-            num_episodes=num_rollout_episodes,
+            num_episodes=int(
+                config.train.online.num_rollout_episodes_per_iter
+            ),
             horizon=int(config.train.online.rollout_horizon),
             terminate_on_success=bool(
                 config.train.online.terminate_on_success
             ),
-            worker_env_names=environment_phase[
-                "worker_env_names"
-            ],
-            episode_quotas=environment_phase[
-                "episode_quotas"
-            ],
             progress_desc="Epoch {} rollout".format(iter_idx),
         )
-        environment_report, environment_flat_stats = (
-            summarize_episodes_by_environment(collected_episodes)
-        )
-        adaptive_stage_controller.update(
-            episodes=collected_episodes,
-            focus_env_name=environment_phase["hard_env"],
-        )
-        stage_priorities, adaptive_metadata = (
-            adaptive_stage_controller.adjust(
-                base_priorities=base_stage_priorities
-            )
-        )
-
         for episode in collected_episodes:
             buffer.add_episode(episode)
 
@@ -2819,13 +2261,6 @@ def train(config, device):
                     True,
                 )
             ),
-            group_by_env_stage=bool(
-                _config_get(
-                    config.algo.rwr,
-                    "group_advantages_by_env_stage",
-                    True,
-                )
-            ),
         )
         buffer.compute_weights(
             temperature=float(config.algo.rwr.reward_temperature),
@@ -2835,53 +2270,9 @@ def train(config, device):
             stage_priorities=stage_priorities,
         )
         rollout_stats = buffer.get_stats()
-        rollout_stats.update(environment_flat_stats)
         rollout_stats["curriculum_progress"] = float(
             curriculum_progress
         )
-        rollout_stats["environment_phase_index"] = float(
-            next(
-                (
-                    index
-                    for index, phase in enumerate(
-                        list(_config_get(
-                            _config_get(
-                                config.train.online,
-                                "environment_curriculum",
-                                {},
-                            ),
-                            "phases",
-                            [],
-                        ))
-                    )
-                    if int(_config_get(phase, "start_epoch", 1))
-                    <= iter_idx
-                    <= int(_config_get(
-                        phase,
-                        "end_epoch",
-                        10 ** 9,
-                    ))
-                ),
-                -1,
-            )
-        )
-        for stage_id in range(1, 5):
-            rollout_stats[
-                f"base_stage_priority_{STAGE_NAMES[stage_id]}"
-            ] = float(base_stage_priorities[stage_id])
-            rollout_stats[
-                f"adaptive_stage_priority_{STAGE_NAMES[stage_id]}"
-            ] = float(stage_priorities[stage_id])
-            rollout_stats[
-                f"ema_condition_rate_{STAGE_NAMES[stage_id]}"
-            ] = float(
-                adaptive_metadata["ema_rates"][stage_id]
-            )
-            rollout_stats[
-                f"adaptive_multiplier_{STAGE_NAMES[stage_id]}"
-            ] = float(
-                adaptive_metadata["multipliers"][stage_id]
-            )
 
         buffer_processing_time_sec = (
             time.perf_counter() - buffer_processing_start
@@ -3087,12 +2478,6 @@ def train(config, device):
             "iter": iter_idx,
             "best_success_rate": best_success_rate,
             "best_return": best_return,
-            "adaptive_stage_controller": (
-                adaptive_stage_controller.state_dict()
-            ),
-            "environment_phase_name": environment_phase[
-                "phase_name"
-            ],
         }
 
         iter_wall_time_sec = time.perf_counter() - iter_wall_start
